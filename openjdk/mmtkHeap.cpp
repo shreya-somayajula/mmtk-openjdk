@@ -21,6 +21,14 @@
  * questions.
  *
  */
+#include <fcntl.h>             /* Definition of O_* constants */
+#include <sys/syscall.h>       /* Definition of SYS_* constants */
+#include <linux/userfaultfd.h> /* Definition of UFFD_* constants */
+#include <err.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <system_error>
 
 #include "precompiled.hpp"
 #include "aot/aotLoader.hpp"
@@ -60,6 +68,65 @@ object iterator??!!
 
 //mmtkGCTaskManager* MMTkHeap::_mmtk_gc_task_manager = NULL;
 
+static void *
+fault_handler_thread(void *arg)
+{
+    int                 nready;
+    long                uffd;   /* userfaultfd file descriptor */
+    ssize_t             nread;
+    struct pollfd       pollfd;
+    struct uffdio_copy  uffdio_copy;
+
+    static int      fault_cnt = 0; /* Number of faults so far handled */
+    static char     *page = NULL;
+    static struct uffd_msg  msg;  /* Data read from userfaultfd */
+
+    uffd = (long) arg;
+
+    /* Loop, handling incoming events on the userfaultfd
+      file descriptor. */
+
+    for (;;) {
+
+        /* See what poll() tells us about the userfaultfd. */
+
+        pollfd.fd = uffd;
+        pollfd.events = POLLIN;
+        nready = poll(&pollfd, 1, -1);
+        if (nready == -1)
+            err(EXIT_FAILURE, "poll");
+
+        printf("\nfault_handler_thread():\n");
+        printf("    poll() returns: nready = %d; "
+              "POLLIN = %d; POLLERR = %d\n", nready,
+              (pollfd.revents & POLLIN) != 0,
+              (pollfd.revents & POLLERR) != 0);
+
+        /* Read an event from the userfaultfd. */
+
+        nread = read(uffd, &msg, sizeof(msg));
+        if (nread == 0) {
+            printf("EOF on userfaultfd!\n");
+            exit(EXIT_FAILURE);
+        }
+
+        if (nread == -1)
+            err(EXIT_FAILURE, "read");
+
+        /* We expect only one kind of event; verify that assumption. */
+
+        if (msg.event != UFFD_EVENT_PAGEFAULT) {
+            fprintf(stderr, "Unexpected event on userfaultfd\n");
+            exit(EXIT_FAILURE);
+        }
+
+        /* Display info about the page-fault event. */
+
+        printf("    UFFD_EVENT_PAGEFAULT event: ");
+        printf("flags = %llx;", msg.arg.pagefault.flags);
+        printf("address = %llx\n", msg.arg.pagefault.address);
+    }
+}
 
 MMTkHeap* MMTkHeap::_heap = NULL;
 
@@ -129,7 +196,7 @@ jint MMTkHeap::initialize() {
 
   _start = (HeapWord*) starting_heap_address();
   _end = (HeapWord*) last_heap_address();
-  //  printf("start: %p, end: %p\n", _start, _end);
+  printf("start: %p, end: %p\n", _start, _end);
   if (UseCompressedOops) {
     Universe::set_narrow_oop_base((address) mmtk_narrow_oop_base());
     Universe::set_narrow_oop_shift(mmtk_narrow_oop_shift());
@@ -137,11 +204,51 @@ jint MMTkHeap::initialize() {
 
   initialize_reserved_region(_start, _end);
 
-
   MMTkBarrierSet* const barrier_set = new MMTkBarrierSet(reserved_region());
   //barrier_set->initialize();
   BarrierSet::set_barrier_set(barrier_set);
+  printf("PROGRAM PAUSED:\n");
+  getchar();
 
+  /* userfaultfd code */
+  // long uffd;
+  // struct uffdio_api       uffdio_api;
+  // struct uffdio_register  uffdio_register;
+  // int        s;
+  // pthread_t  thr;
+
+  // uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+  // if (uffd == -1)
+  //   err(EXIT_FAILURE, "userfaultfd");
+  // printf("Create userfaultfd object\n");
+
+  // uffdio_api.api = UFFD_API;
+  // uffdio_api.features = 0;
+  // if (ioctl(uffd, UFFDIO_API, &uffdio_api) == -1)
+  //     err(EXIT_FAILURE, "ioctl-UFFDIO_API");
+  
+  // printf("Userfaultfd api setup\n");
+
+  // uffdio_register.range.start = (unsigned long) _start;
+  // // uffdio_register.range.len = (size_t) ((char *) _end - (char *) _start);
+  // uffdio_register.range.len = 4096;
+
+  // printf("Range start: %lu, range length: %ld\n", uffdio_register.range.start, uffdio_register.range.len);
+
+  // uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP;
+  // if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1)
+  //     err(EXIT_FAILURE, "ioctl-UFFDIO_REGISTER");
+  
+  // printf("Register memory range of the mapping\n");
+
+  // mprotect(_start, (char *) _end - (char *) _start, PROT_NONE);
+
+  // s = pthread_create(&thr, NULL, fault_handler_thread, (void *) uffd);
+  // if (s != 0) {
+  //     err(EXIT_FAILURE, "pthread_create");
+  // }
+
+  /* --------------------- */
   _companion_thread = new MMTkVMCompanionThread();
   if (!os::create_thread(_companion_thread, os::pgc_thread)) {
     fprintf(stderr, "Failed to create thread");
@@ -151,7 +258,6 @@ jint MMTkHeap::initialize() {
   // Set up the GCTaskManager
   //  _mmtk_gc_task_manager = mmtkGCTaskManager::create(ParallelGCThreads);
   return JNI_OK;
-
 }
 
 void MMTkHeap::set_mmtk_options(bool set_defaults) {

@@ -172,6 +172,7 @@ lazy_static! {
         let ret = mmtk::memory_manager::mmtk_init(&builder);
         MMTK_INITIALIZED.store(true, std::sync::atomic::Ordering::SeqCst);
         slots::initialize_compressed_oops_base_and_shift();
+        println!("IN SINGLETON COMPRESSED!!!!!\n");
         *ret
     };
     pub static ref SINGLETON_UNCOMPRESSED: MMTK<OpenJDK<false>> = {
